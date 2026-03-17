@@ -15,10 +15,7 @@ if hasattr(sys.stdout, 'encoding') and sys.stdout.encoding and sys.stdout.encodi
 BASE_URL = "https://cdn.moltyroyale.com/api"
 
 AGENT_NAMES = [
-    "KangBray_1", "KangBray_2", "KangBray_3", "KangBray_4", "KangBray_5",
-    "KangMan_1", "KangMan_2", "KangMan_3", "KangMan_4", "KangMan_5",
-    "KangDray_1", "KangDray_2", "KangDray_3", "KangDray_4", "KangDray_5",
-    "KangSlay_1", "KangSlay_2", "KangSlay_3", "KangSlay_4", "KangSlay_5"
+    "KangBray_1", "KangBray_2", "KangBray_3", "KangBray_4", "KangBray_5"
 ]
 
 # Data item statis
@@ -114,6 +111,10 @@ class EliteAgent:
         # Navigasi & Looting
         self.target_loot_region = None
         self.squad_file = "squad_sync.json"
+        self.role = "carry" if self.index in (2, 3) else "support"
+        self.focus_target_id = None
+        self.focus_target_region = None
+        self.focus_target_expires = 0.0
 
         try:
             res = requests.get(f"{BASE_URL}/accounts/me", headers=self.headers, timeout=5)
@@ -189,6 +190,20 @@ class EliteAgent:
             allies.append(info)
         return allies
 
+    def squad_mode_active(self, state):
+        me = state.get("self", {})
+        my_region = str(me.get("regionId", ""))
+        visible_allies = sum(
+            1
+            for ag in state.get("visibleAgents", [])
+            if ag.get("id") != self.agent_id and ag.get("name") in TEAM_AGENT_NAMES
+        )
+        nearby_synced_allies = sum(
+            1 for ally in self.get_squad_allies()
+            if str(ally.get("region_id", "")) == my_region
+        )
+        return (visible_allies + nearby_synced_allies) >= 1
+
     def region_enemy_pressure(self, region_id, state):
         return sum(
             1
@@ -223,7 +238,7 @@ class EliteAgent:
     def choose_low_risk_region(self, region_ids, state, hp, moltz_count):
         best_region = None
         best_score = -999
-        allies = self.get_squad_allies()
+        allies = self.get_squad_allies() if self.squad_mode_active(state) else []
         ally_regions = {str(ally.get("region_id", "")) for ally in allies}
 
         for region_id in region_ids:
@@ -252,6 +267,86 @@ class EliteAgent:
                 best_score = score
 
         return best_region
+
+    def get_visible_enemy_count(self, state):
+        return sum(1 for ag in state.get("visibleAgents", []) if ag.get("id") != self.agent_id)
+
+    def assess_combat_risk(self, state, target=None, dist=0):
+        me = state.get("self", {})
+        hp = int(me.get("hp", 100) or 100)
+        ep = int(me.get("ep", 0) or 0)
+        _, weapon_range = self.get_weapon_damage(me)
+        enemy_count = self.get_visible_enemy_count(state)
+        allies = self.get_squad_allies() if self.squad_mode_active(state) else []
+        nearby_allies = sum(1 for ally in allies if ally.get("region_id") == me.get("regionId"))
+        late_game = self.is_late_game()
+        moltz_count = sum(
+            1 for item in (me.get("inventory") or [])
+            if item.get("category") == "currency" or "moltz" in str(item.get("name", "")).lower()
+        )
+
+        risk = 0
+        if hp < 85:
+            risk += (85 - hp) * 0.8
+        if hp < 55:
+            risk += 12
+        if ep < 2:
+            risk += 20
+        elif ep < 4:
+            risk += 8
+
+        if enemy_count >= 2:
+            risk += enemy_count * 10
+        if nearby_allies > 0:
+            risk -= nearby_allies * 7
+
+        if late_game:
+            risk += 10
+        if moltz_count >= 20:
+            risk += min(18, moltz_count // 3)
+
+        if target:
+            target_hp = int(target.get("hp", 100) or 100)
+            eq_enemy = target.get("equippedWeapon") or {}
+            enemy_range = WEAPONS.get(eq_enemy.get("name", "Fist"), {"range": 0})["range"]
+            if target_hp <= 25:
+                risk -= 20
+            elif target_hp <= 45:
+                risk -= 10
+            if weapon_range > enemy_range and dist > 0:
+                risk -= 12
+            elif enemy_range >= weapon_range and dist <= enemy_range:
+                risk += 12
+            if target.get("regionId") == me.get("regionId") and enemy_count >= 2:
+                risk += 15
+
+        return max(0, int(risk))
+
+    def should_engage(self, state, target=None, dist=0):
+        risk = self.assess_combat_risk(state, target, dist)
+        threshold = 50 if self.role == "carry" else 42
+        if self.is_late_game():
+            threshold -= 8
+        return risk < threshold, risk
+
+    def remember_focus_target(self, target):
+        if not target:
+            return
+        self.focus_target_id = target.get("id")
+        self.focus_target_region = target.get("regionId")
+        self.focus_target_expires = time.time() + 95
+
+    def get_focus_target(self, state):
+        if not self.focus_target_id or time.time() > self.focus_target_expires:
+            self.focus_target_id = None
+            self.focus_target_region = None
+            return None
+
+        for group in (state.get("visibleAgents", []), state.get("visibleMonsters", [])):
+            for unit in group:
+                if unit.get("id") == self.focus_target_id:
+                    return unit
+        return None
 
     def item_priority_score(self, item):
         if not item:
@@ -360,6 +455,8 @@ class EliteAgent:
         connections = state.get("currentRegion", {}).get("connections", []) or []
         conn_ids = [(c.get("id") if isinstance(c, dict) else c) for c in connections]
         conn_ids = [str(cid) for cid in conn_ids if cid]
+        if not self.squad_mode_active(state):
+            return None
         allies = self.get_squad_allies()
         if not allies:
             return None
@@ -740,6 +837,49 @@ class EliteAgent:
         # Berarti kita benar-benar terkepung. Lebih baik diam saja untuk hemat EP / serang musuh.
         return None
 
+    def find_best_retreat_route(self, state):
+        me = state.get("self", {})
+        connections = state.get("currentRegion", {}).get("connections", []) or []
+        conn_ids = [(c.get("id") if isinstance(c, dict) else c) for c in connections]
+        conn_ids = [str(cid) for cid in conn_ids if cid]
+        moltz_count = sum(
+            1 for item in (me.get("inventory") or [])
+            if item.get("category") == "currency" or "moltz" in str(item.get("name", "")).lower()
+        )
+
+        best_region = None
+        best_score = -999
+        allies = self.get_squad_allies() if self.squad_mode_active(state) else []
+        ally_regions = {str(ally.get("region_id", "")) for ally in allies}
+
+        for region_id in conn_ids:
+            if not self.is_region_safe(region_id):
+                continue
+
+            enemy_pressure = self.region_enemy_pressure(region_id, state)
+            score = 50 - enemy_pressure * 22
+
+            if region_id not in self.visited_regions:
+                score += 10
+            if region_id in ally_regions and enemy_pressure <= 1:
+                score += 10
+
+            reg = self.known_regions.get(region_id, {})
+            terrain = reg.get("terrain", "")
+            if terrain == "hills":
+                score += 8
+            if terrain == "water":
+                score -= 18
+
+            if self.is_late_game() or moltz_count >= 25:
+                score -= enemy_pressure * 12
+
+            if score > best_score:
+                best_region = region_id
+                best_score = score
+
+        return best_region
+
     # ==================== INVENTORY MANAGEMENT ====================
     def evaluate_weapon(self, item):
         if not item: return 0
@@ -928,13 +1068,25 @@ class EliteAgent:
         connections = curr_region.get("connections", [])
         visible_agents = state.get("visibleAgents", [])
         visible_monsters = state.get("visibleMonsters", [])
-        squad_allies = self.get_squad_allies()
+        squad_allies = self.get_squad_allies() if self.squad_mode_active(state) else []
         ally_regions = {str(ally.get("region_id", "")) for ally in squad_allies}
         
         best_target = None
         best_score = 999
         best_type = None
         best_hits = 999
+
+        focus_target = self.get_focus_target(state)
+        if focus_target and focus_target.get("id") != self.agent_id:
+            focus_region = focus_target.get("regionId")
+            is_here = focus_region == me["regionId"]
+            is_adj = any((isinstance(c, dict) and c.get("id") == focus_region) or c == focus_region for c in connections)
+            focus_dist = 0 if is_here else (1 if is_adj else 2)
+            if focus_dist <= weapon_range:
+                worth, hits = self.is_worth_attacking(focus_target, damage, "agent", state, weapon_range, focus_dist)
+                engage, _ = self.should_engage(state, focus_target, focus_dist)
+                if worth and engage:
+                    return focus_target, "agent", hits
         
         # JIKA SOLO: Inisiasi Insting Berburu
         # Kita izinkan mengevaluasi musuh selama tubuh kita tidak sekarat banget (< 40)
@@ -975,11 +1127,14 @@ class EliteAgent:
             worth, hits = self.is_worth_attacking(a, damage, "agent", state, weapon_range, dist)  # type: ignore
             if not worth:
                 continue
+            engage, risk = self.should_engage(state, a, dist)
+            if not engage and a.get("hp", 100) > 25:
+                continue
             
             
             # --- APEX SCORING ---
             # Skor lebih kecil = Lebih Prioritas
-            score = hits * 10 
+            score = hits * 10 + risk
             
             # Bonus: Target Sekarat (Executioner Mode)
             if a["hp"] <= 25:
@@ -1067,6 +1222,14 @@ class EliteAgent:
                 log(self.index, "🚧 TERKEPUNG DEATHZONE! Tidak ada jalan keluar aman. Bersiap tempur di tempat!")
                 # Kita tidak me-return apapun di sini, agar bot lanjut mengeksekusi logika 
                 # Attack musuh / Heal / dsb di sisa kode di bawah ini.
+
+        late_game_survival = self.is_late_game() and (hp < 85 or moltz_count >= 15 or me.get("kills", 0) >= 2)
+        current_enemy_pressure = self.region_enemy_pressure(me["regionId"], state)
+        if late_game_survival and current_enemy_pressure >= 2:
+            retreat = self.find_best_retreat_route(state)
+            if retreat and retreat != me["regionId"]:
+                log(self.index, f"🛡️ LATE GAME SURVIVAL: keluar dari cluster musuh ({current_enemy_pressure})")
+                return {"type": "move", "regionId": retreat}, "Late game retreat"
         
         # ===== PRIORITAS 2: PENGEROYOKAN (ESCAPE FIRST) =====
         if under_attack:
@@ -1090,14 +1253,14 @@ class EliteAgent:
                 # Jika kita sadar ada 2 atau lebih pemain lain di area ini dan kita sedang diserang,
                 # itu adalah situasi berisiko tinggi dikeroyok. Mundur taktis ("Bukan pengecut, tapi jenius").
                 if len(attackers) >= 2 and hp < 85:
-                    escape = self.find_escape_route(connections, self.last_region_id, curr["id"])
+                    escape = self.find_best_retreat_route(state) or self.find_escape_route(connections, self.last_region_id, curr["id"])
                     if escape:
                         log(self.index, f"🏃 TERJEBAK CROSSFIRE ({len(attackers)} MUSUH)! Mundur taktis menghindari third-party...")
                         return {"type": "move", "regionId": escape}, "Retreat from crossfire"
                 
                 # Kalah senjata jarak dekat (Kabur individual)
                 if not has_weapon and hp < 50:
-                    escape = self.find_escape_route(connections, self.last_region_id, curr["id"])
+                    escape = self.find_best_retreat_route(state) or self.find_escape_route(connections, self.last_region_id, curr["id"])
                     if escape:
                         log(self.index, "🏃 HP Menipis & kalah gear dari penyerang, mundur mencari celah!")
                         return {"type": "move", "regionId": escape}, "Retreat low hp"
@@ -1105,7 +1268,7 @@ class EliteAgent:
             else:
                 # KITA DISERANG, TAPI MUSUH DI LUAR JANGKAUAN (Contoh: Di-snipe, kita pegang Katana)
                 # JANGAN buang-buang turn buat serang! Kabur ke tempat aman.
-                escape = self.find_escape_route(connections, self.last_region_id, curr["id"])
+                escape = self.find_best_retreat_route(state) or self.find_escape_route(connections, self.last_region_id, curr["id"])
                 if escape:
                     log(self.index, f"🎯 Tembakan Sniper dari jauh! Mundur mencari perlindungan!")
                     return {"type": "move", "regionId": escape}, "Retreat from sniper"
@@ -1122,7 +1285,7 @@ class EliteAgent:
             # SOLO MODE REVISION: Kalau kita dikeroyok / atau sendirian, pertimbangkan HP.
             # Meskipun 1 vs 1, kalau HP kita < 35, lebih baik jangan asal Attack balik, kabur!
             if hp < 35 and target_agent["hp"] > 25:
-                escape = self.find_escape_route(connections, self.last_region_id, curr["id"])
+                escape = self.find_best_retreat_route(state) or self.find_escape_route(connections, self.last_region_id, curr["id"])
                 if escape:
                     log(self.index, "🏃 HP Kritis di Bawah 35! Daripada mati bela diri, mending lari cari obat!")
                     return {"type": "move", "regionId": escape}, "Retreat to heal self"
@@ -1160,7 +1323,7 @@ class EliteAgent:
         if hp < HP_CRITICAL and not under_attack:
             # Jika EP kita cukup, coba pindah menjauhi keramaian
             if ep >= 3:
-                escape = self.find_escape_route(connections, self.last_region_id, curr["id"])
+                escape = self.find_best_retreat_route(state) or self.find_escape_route(connections, self.last_region_id, curr["id"])
                 if escape and escape != curr["id"]:
                     log(self.index, f"🏃 HP Menipis tanpa medkit, cari tempat sembunyi yang aman...")
                     return {"type": "move", "regionId": escape}, "Safe retreat (No Heal)"
@@ -1230,6 +1393,10 @@ class EliteAgent:
         target, target_type, hits = self.find_best_target(state, damage, weapon_range)
         if target:
             ag_hp = target.get("hp", 100)
+            is_here = target.get("regionId") == me.get("regionId")
+            is_adj = any((isinstance(c, dict) and c.get("id") == target.get("regionId")) or c == target.get("regionId") for c in connections)
+            dist_target = 0 if is_here else (1 if is_adj else 2)
+            engage, risk = self.should_engage(state, target, dist_target)
             
             # Kapan kita BERBURU untuk Kill Ranking?
             # 1. Musuh sedang lemah (HP di bawah 45) -> Kita jdi Algojo!
@@ -1243,14 +1410,16 @@ class EliteAgent:
             is_deadly_weapon = equipped_weapon_name in ["Sniper", "Katana", "Sword", "Pistol", "Bow"]
             is_prime_condition = hp >= 70
             easy_kill = hits <= 2
+            last_hit_window = ag_hp <= max(18, damage)
             
-            if is_weak_target or (is_deadly_weapon and is_prime_condition) or easy_kill:
+            if engage and (is_weak_target or (is_deadly_weapon and is_prime_condition) or easy_kill or last_hit_window):
                 behavior = "SNIPE" if target["regionId"] != me["regionId"] else "ASSASSINATE"
-                log_msg = f"🎯 INSTING BERBURU: {behavior} {target_type} {target.get('name', 'Unknown')} (HP: {ag_hp}, Hits: {hits})"
+                log_msg = f"🎯 INSTING BERBURU: {behavior} {target_type} {target.get('name', 'Unknown')} (HP: {ag_hp}, Hits: {hits}, Risk: {risk})"
                 log(self.index, log_msg)
                 
                 if hits <= 1:
                     self.target_loot_region = target["regionId"]
+                self.remember_focus_target(target)
                     
                 return {
                     "type": "attack", 
