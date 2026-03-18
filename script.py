@@ -15,7 +15,10 @@ if hasattr(sys.stdout, 'encoding') and sys.stdout.encoding and sys.stdout.encodi
 BASE_URL = "https://cdn.moltyroyale.com/api"
 
 AGENT_NAMES = [
-    "KangBray_1", "KangBray_2", "KangBray_3", "KangBray_4", "KangBray_5"
+    "KangBray_1", "KangBray_2", "KangBray_3", "KangBray_4", "KangBray_5",
+    "KangMan_1", "KangMan_2", "KangMan_3", "KangMan_4", "KangMan_5",
+    "KangDzut_1", "KangDzut_2", "KangDzut_3", "KangDzut_4", "KangDzut_5",
+    "KangSlay_1", "KangSlay_2", "KangSlay_3", "KangSlay_4", "KangSlay_5"
 ]
 
 # Data item statis
@@ -518,7 +521,19 @@ class EliteAgent:
                 # Cari game bebas, semuanya sekarang berlaku sebagai pemain Solo!
                 res = requests.get(f"{BASE_URL}/games?status=waiting", timeout=10)
                 if res.status_code != 200:
-                    log(self.index, f"⚠️ Server Busy/Error: {res.status_code}. Tunggu 25 detik...")
+                    detail = ""
+                    try:
+                        err_data = res.json()
+                        err = err_data.get("error", {}) if isinstance(err_data, dict) else {}
+                        code = err.get("code", "")
+                        msg = err.get("message", "")
+                        if code or msg:
+                            detail = f" [{code}] {msg}".strip()
+                    except Exception:
+                        body = (res.text or "").strip().replace("\n", " ")
+                        if body:
+                            detail = f" {body[:120]}"
+                    log(self.index, f"⚠️ Server Busy/Error: {res.status_code}.{detail} Tunggu 25 detik...")
                     time.sleep(25)
                     continue
                 
@@ -686,7 +701,19 @@ class EliteAgent:
                     return None
                     
                 else:
-                    log(self.index, f"⚠️ State error {res.status_code}, attempt {attempt+1}")
+                    detail = ""
+                    try:
+                        err_data = res.json()
+                        err = err_data.get("error", {}) if isinstance(err_data, dict) else {}
+                        code = err.get("code", "")
+                        msg = err.get("message", "")
+                        if code or msg:
+                            detail = f" [{code}] {msg}".strip()
+                    except Exception:
+                        body = (res.text or "").strip().replace("\n", " ")
+                        if body:
+                            detail = f" {body[:120]}"
+                    log(self.index, f"⚠️ State error {res.status_code}{detail}, attempt {attempt+1}")
                     time.sleep(base_delay * (attempt + 1))
                     
             except requests.exceptions.Timeout:
@@ -744,8 +771,9 @@ class EliteAgent:
                     if code == "INSUFFICIENT_EP":
                         return {"success": False, "code": "INSUFFICIENT_EP", "message": "Not enough EP"}
 
-                    log(self.index, f"⚠️ Action error {res.status_code}: {res.text[:50]}")
-                    return {"success": False, "code": code or f"HTTP_{res.status_code}", "message": f"HTTP {res.status_code}"}
+                    detail = (res.text or "").strip().replace("\n", " ")
+                    log(self.index, f"⚠️ Action error {res.status_code}: {detail[:120]}")
+                    return {"success": False, "code": code or f"HTTP_{res.status_code}", "message": detail[:120] or f"HTTP {res.status_code}"}
 
             except Exception as e:
                 log(self.index, f"❌ Send action error: {e}")
